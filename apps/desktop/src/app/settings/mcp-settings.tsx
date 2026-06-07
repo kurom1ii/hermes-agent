@@ -5,11 +5,11 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { getHermesConfigRecord, type HermesGateway, saveHermesConfig } from '@/hermes'
-import { useI18n } from '@/i18n'
 import { Wrench } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
-import { $activeSessionId } from '@/store/session'
+import { $activeSessionId, $mcpStatus, setMcpStatus } from '@/store/session'
+import type { McpServerStatusItem } from '@/store/session'
 import type { HermesConfigRecord } from '@/types/hermes'
 
 import { EmptyState, LoadingState, Pill, SettingsContent } from './primitives'
@@ -44,9 +44,8 @@ const transportLabel = (server: Record<string, unknown>) =>
         : 'custom'
 
 export function McpSettings({ gateway, onConfigSaved }: McpSettingsProps) {
-  const { t } = useI18n()
-  const m = t.settings.mcp
   const activeSessionId = useStore($activeSessionId)
+  const mcpRuntimeStatus = useStore($mcpStatus)
   const [config, setConfig] = useState<HermesConfigRecord | null>(null)
   const [selected, setSelected] = useState<string | null>(null)
   const [name, setName] = useState('')
@@ -67,13 +66,37 @@ export function McpSettings({ gateway, onConfigSaved }: McpSettingsProps) {
         const first = Object.keys(getServers(next)).sort()[0] ?? null
         setSelected(first)
       })
-      .catch(err => notifyError(err, m.failedLoad))
+      .catch(err => notifyError(err, 'MCP config failed to load'))
 
     return () => void (cancelled = true)
   }, [])
 
+  useEffect(() => {
+    if (!gateway) {
+      return
+    }
+
+    let cancelled = false
+
+    gateway
+      .request<{ servers: McpServerStatusItem[] }>('mcp.status')
+      .then(res => {
+        if (!cancelled && Array.isArray(res?.servers)) {
+          setMcpStatus(res.servers)
+        }
+      })
+      .catch(() => {})
+
+    return () => void (cancelled = true)
+  }, [gateway])
+
   const servers = useMemo(() => getServers(config), [config])
   const names = useMemo(() => Object.keys(servers).sort(), [servers])
+
+  const mcpStatusByName = useMemo(
+    () => Object.fromEntries(mcpRuntimeStatus.map(s => [s.name, s])),
+    [mcpRuntimeStatus]
+  )
 
   useDeepLinkHighlight({
     block: 'nearest',
@@ -91,14 +114,14 @@ export function McpSettings({ gateway, onConfigSaved }: McpSettingsProps) {
   }, [selected, servers])
 
   if (!config) {
-    return <LoadingState label={m.loading} />
+    return <LoadingState label="Loading MCP servers..." />
   }
 
   const saveServer = async () => {
     const nextName = name.trim()
 
     if (!nextName) {
-      notify({ kind: 'error', title: m.nameRequiredTitle, message: m.nameRequiredMessage })
+      notify({ kind: 'error', title: 'Name required', message: 'Give this MCP server a config key.' })
 
       return
     }
@@ -109,12 +132,12 @@ export function McpSettings({ gateway, onConfigSaved }: McpSettingsProps) {
       const raw = JSON.parse(body)
 
       if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-        throw new Error(m.objectRequired)
+        throw new Error('Server config must be a JSON object')
       }
 
       parsed = raw as Record<string, unknown>
     } catch (err) {
-      notifyError(err, m.invalidJson)
+      notifyError(err, 'Invalid MCP JSON')
 
       return
     }
@@ -135,9 +158,9 @@ export function McpSettings({ gateway, onConfigSaved }: McpSettingsProps) {
       setConfig(nextConfig)
       setSelected(nextName)
       onConfigSaved?.()
-      notify({ kind: 'success', title: m.savedTitle, message: m.savedMessage(nextName) })
+      notify({ kind: 'success', title: 'MCP server saved', message: `${nextName} applies after MCP reload.` })
     } catch (err) {
-      notifyError(err, m.saveFailed)
+      notifyError(err, 'Save failed')
     } finally {
       setSaving(false)
     }
@@ -156,7 +179,7 @@ export function McpSettings({ gateway, onConfigSaved }: McpSettingsProps) {
       setSelected(Object.keys(nextServers).sort()[0] ?? null)
       onConfigSaved?.()
     } catch (err) {
-      notifyError(err, m.removeFailed)
+      notifyError(err, 'Remove failed')
     } finally {
       setSaving(false)
     }
@@ -164,7 +187,7 @@ export function McpSettings({ gateway, onConfigSaved }: McpSettingsProps) {
 
   const reloadMcp = async () => {
     if (!gateway) {
-      notify({ kind: 'warning', title: m.gatewayUnavailableTitle, message: m.gatewayUnavailableMessage })
+      notify({ kind: 'warning', title: 'Gateway unavailable', message: 'Reconnect the gateway before reloading MCP.' })
 
       return
     }
@@ -176,9 +199,18 @@ export function McpSettings({ gateway, onConfigSaved }: McpSettingsProps) {
         confirm: true,
         session_id: activeSessionId ?? undefined
       })
-      notify({ kind: 'success', title: m.reloadedTitle, message: m.reloadedMessage })
+
+      try {
+        const status = await gateway.request<{ servers: McpServerStatusItem[] }>('mcp.status')
+
+        if (Array.isArray(status?.servers)) {
+          setMcpStatus(status.servers)
+        }
+      } catch {}
+
+      notify({ kind: 'success', title: 'MCP tools reloaded', message: 'New tool schemas apply to fresh turns.' })
     } catch (err) {
-      notifyError(err, m.reloadFailed)
+      notifyError(err, 'MCP reload failed')
     } finally {
       setReloading(false)
     }
@@ -188,22 +220,24 @@ export function McpSettings({ gateway, onConfigSaved }: McpSettingsProps) {
     <SettingsContent>
       <div className="mb-4 flex items-center justify-end gap-4">
         <Button onClick={() => setSelected(null)} size="xs" variant="text">
-          {m.newServer}
+          New server
         </Button>
         <Button disabled={reloading} onClick={() => void reloadMcp()} size="xs" variant="text">
-          {reloading ? m.reloading : m.reload}
+          {reloading ? 'Reloading...' : 'Reload MCP'}
         </Button>
       </div>
 
       <div className="grid min-h-0 gap-6 lg:grid-cols-[16rem_minmax(0,1fr)]">
         <div className="min-h-64">
           {names.length === 0 ? (
-            <EmptyState description={m.emptyDesc} title={m.emptyTitle} />
+            <EmptyState description="Add a stdio or HTTP server to expose MCP tools." title="No MCP servers" />
           ) : (
             <div className="grid gap-0.5">
               {names.map(serverName => {
                 const server = servers[serverName]
                 const active = selected === serverName
+                const runtime = mcpStatusByName[serverName]
+                const isConnected = runtime?.connected === true
 
                 return (
                   <button
@@ -216,10 +250,18 @@ export function McpSettings({ gateway, onConfigSaved }: McpSettingsProps) {
                     onClick={() => setSelected(serverName)}
                     type="button"
                   >
-                    <div className="truncate text-sm font-medium">{serverName}</div>
+                    <div className="flex items-center gap-1.5 truncate text-sm font-medium">
+                      {isConnected && (
+                        <span className="inline-block size-2 shrink-0 rounded-full bg-emerald-500" title="Connected" />
+                      )}
+                      <span className="truncate">{serverName}</span>
+                    </div>
                     <div className="mt-1 flex items-center gap-1.5">
                       <Pill>{transportLabel(server)}</Pill>
-                      {server.disabled === true && <Pill>{m.disabled}</Pill>}
+                      {server.disabled === true && <Pill>disabled</Pill>}
+                      {runtime && !runtime.connected && !runtime.disabled && (
+                        <span className="text-red-500 text-xs">disconnected</span>
+                      )}
                     </div>
                   </button>
                 )
@@ -231,14 +273,14 @@ export function McpSettings({ gateway, onConfigSaved }: McpSettingsProps) {
         <div className="grid content-start gap-3">
           <div className="flex items-center gap-2 text-sm font-medium">
             <Wrench className="size-4 text-muted-foreground" />
-            {selected ? m.editServer : m.newServer}
+            {selected ? 'Edit server' : 'New server'}
           </div>
           <label className="grid gap-1.5">
-            <span className="text-xs text-muted-foreground">{m.name}</span>
+            <span className="text-xs text-muted-foreground">Name</span>
             <Input onChange={event => setName(event.currentTarget.value)} placeholder="filesystem" value={name} />
           </label>
           <label className="grid gap-1.5">
-            <span className="text-xs text-muted-foreground">{m.serverJson}</span>
+            <span className="text-xs text-muted-foreground">Server JSON</span>
             <Textarea
               className="min-h-80 font-mono text-xs"
               onChange={event => setBody(event.currentTarget.value)}
@@ -255,13 +297,13 @@ export function McpSettings({ gateway, onConfigSaved }: McpSettingsProps) {
                 size="xs"
                 variant="text"
               >
-                {m.remove}
+                Remove
               </Button>
             ) : (
               <span />
             )}
             <Button disabled={saving} onClick={() => void saveServer()} size="sm">
-              {saving ? t.common.saving : m.saveServer}
+              {saving ? 'Saving...' : 'Save server'}
             </Button>
           </div>
         </div>
